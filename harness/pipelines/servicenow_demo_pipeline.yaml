@@ -1,0 +1,327 @@
+pipeline:
+  name: ServiceNow Demo Pipeline
+  identifier: ServiceNow_Demo_Pipeline
+  projectIdentifier: default_project
+  orgIdentifier: default
+  description: Demo pipeline with ServiceNow change creation, approval gate, and final update.
+  tags: {}
+  variables:
+    - name: SN_INSTANCE_URL
+      type: String
+      description: ServiceNow base URL
+      value: <+input>.default("https://dev395848.service-now.com")
+    - name: SN_USERNAME
+      type: String
+      description: ServiceNow integration user
+      value: <+input>.default("harness_integration")
+    - name: CHANGE_SHORT_DESCRIPTION
+      type: String
+      value: <+input>.default("Demo change opened by Harness pipeline")
+    - name: CHANGE_DESCRIPTION
+      type: String
+      value: <+input>.default("This is an automated change created for Harness x ServiceNow demo.")
+    - name: ASSIGNMENT_GROUP
+      type: String
+      value: <+input>.default("CAB Approval")
+    - name: FAIL_IF_NOT_CLOSED
+      type: String
+      value: <+input>.default("false")
+  stages:
+    - stage:
+        name: Build Validation
+        identifier: Build_Validation
+        description: Simple pre-check stage
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Precheck
+                  identifier: Precheck
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          set -e
+                          echo "Running demo pre-checks..."
+                          echo "Date: $(date)"
+                          echo "Pipeline: <+pipeline.name>"
+                          echo "Execution: <+pipeline.sequenceId>"
+                          echo "OK"
+                    environmentVariables: []
+                    outputVariables: []
+                  timeout: 10m
+        tags: {}
+
+    - stage:
+        name: Open Change In ServiceNow
+        identifier: Open_Change_In_ServiceNow
+        description: Create a change_request and capture ticket data
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Create Change Request
+                  identifier: Create_Change_Request
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          set -e
+
+                          # Normalize values coming from runtime/inputset that may include wrapping quotes.
+                          SN_URL=$(echo "$SN_URL" | sed 's/^"//; s/"$//')
+                          SN_USER=$(echo "$SN_USER" | sed 's/^"//; s/"$//')
+                          SN_PASS=$(echo "$SN_PASS" | sed 's/^"//; s/"$//')
+
+                          if [ -z "$SN_URL" ] || [ -z "$SN_USER" ] || [ -z "$SN_PASS" ] || [ "$SN_URL" = "null" ] || [ "$SN_USER" = "null" ] || [ "$SN_PASS" = "null" ]; then
+                            echo "Missing required auth variables (SN_URL/SN_USER/SN_PASS)."
+                            exit 1
+                          fi
+
+                          echo "Auth debug: SN_URL=$SN_URL"
+                          echo "Auth debug: SN_USER=$SN_USER"
+                          echo "Auth debug: SN_PASS length=${#SN_PASS}"
+
+                          echo "Creating ServiceNow change_request..."
+
+                          HTTP_STATUS=$(curl -sS -u "$SN_USER:$SN_PASS" \
+                            -H "Content-Type: application/json" \
+                            -H "Accept: application/json" \
+                            -X POST \
+                            "$SN_URL/api/now/table/change_request?sysparm_fields=number,sys_id" \
+                            -w "%{http_code}" \
+                            -o sn_create_response.json \
+                            --data @- << 'JSON'
+                          {
+                            "short_description": "<+pipeline.variables.CHANGE_SHORT_DESCRIPTION>",
+                            "description": "<+pipeline.variables.CHANGE_DESCRIPTION>",
+                            "category": "software",
+                            "type": "normal",
+                            "assignment_group": "<+pipeline.variables.ASSIGNMENT_GROUP>"
+                          }
+                          JSON
+                          )
+
+                          RESPONSE=$(cat sn_create_response.json)
+
+                          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+                            echo "ServiceNow create failed with HTTP status: $HTTP_STATUS"
+                            cat sn_create_response.json
+                            exit 1
+                          fi
+
+                          SN_CHANGE_NUMBER=$(echo "$RESPONSE" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                          SN_CHANGE_SYS_ID=$(echo "$RESPONSE" | tr -d '\n' | sed -n 's/.*"sys_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+                          if [ -z "$SN_CHANGE_NUMBER" ] || [ -z "$SN_CHANGE_SYS_ID" ]; then
+                            echo "Failed to parse ServiceNow create response"
+                            cat sn_create_response.json
+                            exit 1
+                          fi
+
+                          echo "Created change: $SN_CHANGE_NUMBER"
+                          echo "SN_CHANGE_NUMBER=$SN_CHANGE_NUMBER"
+                          echo "SN_CHANGE_SYS_ID=$SN_CHANGE_SYS_ID"
+                    environmentVariables:
+                      - name: SN_URL
+                        type: String
+                        value: <+pipeline.variables.SN_INSTANCE_URL>
+                      - name: SN_USER
+                        type: String
+                        value: <+pipeline.variables.SN_USERNAME>
+                      - name: SN_PASS
+                        type: Secret
+                        value: harness_integration
+                    outputVariables:
+                      - name: SN_CHANGE_NUMBER
+                        type: String
+                        value: SN_CHANGE_NUMBER
+                      - name: SN_CHANGE_SYS_ID
+                        type: String
+                        value: SN_CHANGE_SYS_ID
+                  timeout: 10m
+        tags: {}
+
+    - stage:
+        name: Approval Gate
+        identifier: Approval_Gate
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: HarnessApproval
+                  name: CAB Approval
+                  identifier: CAB_Approval
+                  spec:
+                    approvalMessage: |
+                      Approve deployment for change <+pipeline.stages.Open_Change_In_ServiceNow.spec.execution.steps.Create_Change_Request.output.outputVariables.SN_CHANGE_NUMBER>
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      userGroups:
+                        - _project_all_users
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                    approverInputs: []
+                  timeout: 1d
+        tags: {}
+
+    - stage:
+        name: Deploy Simulation
+        identifier: Deploy_Simulation
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Simulated Deploy
+                  identifier: Simulated_Deploy
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          set -e
+                          echo "Deploy approved for change: <+pipeline.stages.Open_Change_In_ServiceNow.spec.execution.steps.Create_Change_Request.output.outputVariables.SN_CHANGE_NUMBER>"
+                          echo "Running simulated deployment..."
+                          sleep 2
+                          echo "Deployment finished successfully."
+                    environmentVariables: []
+                    outputVariables: []
+                  timeout: 10m
+        tags: {}
+
+    - stage:
+        name: Close Change In ServiceNow
+        identifier: Close_Change_In_ServiceNow
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Update Change Request
+                  identifier: Update_Change_Request
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          set -e
+
+                          # Normalize values coming from runtime/inputset that may include wrapping quotes.
+                          SN_URL=$(echo "$SN_URL" | sed 's/^"//; s/"$//')
+                          SN_USER=$(echo "$SN_USER" | sed 's/^"//; s/"$//')
+                          SN_PASS=$(echo "$SN_PASS" | sed 's/^"//; s/"$//')
+
+                          if [ -z "$SN_URL" ] || [ -z "$SN_USER" ] || [ -z "$SN_PASS" ] || [ "$SN_URL" = "null" ] || [ "$SN_USER" = "null" ] || [ "$SN_PASS" = "null" ]; then
+                            echo "Missing required auth variables (SN_URL/SN_USER/SN_PASS)."
+                            exit 1
+                          fi
+
+                          echo "Auth debug (update): SN_URL=$SN_URL"
+                          echo "Auth debug (update): SN_USER=$SN_USER"
+                          echo "Auth debug (update): SN_PASS length=${#SN_PASS}"
+
+                          SN_CHANGE_SYS_ID="<+pipeline.stages.Open_Change_In_ServiceNow.spec.execution.steps.Create_Change_Request.output.outputVariables.SN_CHANGE_SYS_ID>"
+                          SN_CHANGE_NUMBER="<+pipeline.stages.Open_Change_In_ServiceNow.spec.execution.steps.Create_Change_Request.output.outputVariables.SN_CHANGE_NUMBER>"
+
+                          if [ -z "$SN_CHANGE_SYS_ID" ] || [ -z "$SN_CHANGE_NUMBER" ] || [ "$SN_CHANGE_SYS_ID" = "null" ] || [ "$SN_CHANGE_NUMBER" = "null" ]; then
+                            echo "Missing change outputs from Open Change stage."
+                            echo "SN_CHANGE_NUMBER=$SN_CHANGE_NUMBER"
+                            echo "SN_CHANGE_SYS_ID=$SN_CHANGE_SYS_ID"
+                            exit 1
+                          fi
+
+                          echo "Updating change $SN_CHANGE_NUMBER ($SN_CHANGE_SYS_ID)..."
+
+                          transition_state() {
+                            local TARGET_STATE="$1"
+                            local EXTRA_JSON="$2"
+                            local PAYLOAD
+
+                            PAYLOAD=$(printf '{"state":"%s","work_notes":"Harness demo execution <+pipeline.sequenceId>: transition to %s","comments":"Deployment executed after Harness approval gate."%s}' "$TARGET_STATE" "$TARGET_STATE" "$EXTRA_JSON")
+
+                            HTTP_STATUS=$(curl -sS -u "$SN_USER:$SN_PASS" \
+                              -H "Content-Type: application/json" \
+                              -H "Accept: application/json" \
+                              -X PATCH \
+                              "$SN_URL/api/now/table/change_request/$SN_CHANGE_SYS_ID?sysparm_input_display_value=true" \
+                              -w "%{http_code}" \
+                              -o sn_update_response.json \
+                              --data "$PAYLOAD")
+
+                            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                              echo "Transition to $TARGET_STATE succeeded."
+                              return 0
+                            fi
+
+                            echo "Transition to $TARGET_STATE failed (HTTP $HTTP_STATUS)."
+                            cat sn_update_response.json
+                            return 1
+                          }
+
+                          # Respect ServiceNow Change Model transitions instead of jumping directly to Closed.
+                          transition_state "Assess" "" || true
+                          transition_state "Authorize" "" || true
+                          transition_state "Scheduled" "" || true
+                          transition_state "Implement" "" || true
+                          transition_state "Review" "" || true
+                          transition_state "Closed" ", \"close_code\": \"successful\", \"close_notes\": \"Change closed automatically by Harness demo pipeline.\"" || true
+
+                          VERIFY_STATUS=$(curl -sS -u "$SN_USER:$SN_PASS" \
+                            -H "Accept: application/json" \
+                            "$SN_URL/api/now/table/change_request/$SN_CHANGE_SYS_ID?sysparm_fields=state,number" \
+                            -o sn_verify_response.json \
+                            -w "%{http_code}")
+
+                          if [ "$VERIFY_STATUS" -lt 200 ] || [ "$VERIFY_STATUS" -ge 300 ]; then
+                            echo "Failed to verify final state (HTTP $VERIFY_STATUS)."
+                            cat sn_verify_response.json
+                            exit 1
+                          fi
+
+                          FINAL_STATE=$(cat sn_verify_response.json | tr -d '\n' | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                          if [ "$FINAL_STATE" != "Closed" ]; then
+                            echo "Change was not closed. Final state: $FINAL_STATE"
+                            cat sn_verify_response.json
+
+                            if [ "<+pipeline.variables.FAIL_IF_NOT_CLOSED>" = "true" ]; then
+                              echo "FAIL_IF_NOT_CLOSED=true, failing step."
+                              exit 1
+                            fi
+
+                            echo "Continuing pipeline because FAIL_IF_NOT_CLOSED=false."
+                            echo "ServiceNow workflow requires approval/transition in SN for full closure."
+                            exit 0
+                          fi
+
+                          echo "Change updated successfully and closed."
+                    environmentVariables:
+                      - name: SN_URL
+                        type: String
+                        value: <+pipeline.variables.SN_INSTANCE_URL>
+                      - name: SN_USER
+                        type: String
+                        value: <+pipeline.variables.SN_USERNAME>
+                      - name: SN_PASS
+                        type: Secret
+                        value: harness_integration
+                    outputVariables: []
+                  timeout: 10m
+        tags: {}

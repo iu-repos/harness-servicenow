@@ -1,0 +1,26 @@
+inputSet:
+  name: ServiceNow Demo Input Set
+  identifier: ServiceNow_Demo_InputSet
+  orgIdentifier: default
+  projectIdentifier: default_project
+  pipeline:
+    identifier: ServiceNow_Demo_Pipeline
+    variables:
+      - name: SN_INSTANCE_URL
+        type: String
+        value: https://dev395848.service-now.com
+      - name: SN_USERNAME
+        type: String
+        value: harness_integration
+      - name: CHANGE_SHORT_DESCRIPTION
+        type: String
+        value: Demo change opened by Harness pipeline
+      - name: CHANGE_DESCRIPTION
+        type: String
+        value: This is an automated change created for Harness x ServiceNow demo.
+      - name: ASSIGNMENT_GROUP
+        type: String
+        value: CAB Approval
+      - name: FAIL_IF_NOT_CLOSED
+        type: String
+        value: "false"
